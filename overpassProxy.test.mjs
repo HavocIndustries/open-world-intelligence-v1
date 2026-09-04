@@ -1,216 +1,225 @@
-// Overpass proxy Tier A hardening (voice-engine evaluation doc §4.1, field test
-// 2026-07-23): region/state boundary pivots return multi-MB coastline geometry that
-// blew the old 12 MB read cap and 16 s client budget (Sicily never traced). The proxy
-// now simplifies giant `out geom` payloads server-side before caching/serving, and
-// boundary-class queries (is_in / pivot) get a longer disk TTL — boundaries change
-// ≈never. Pure-function tests, no network.
+// OVERPASS PROXY — which upstream answers count as an answer.
 //
-// Run with: npm test   (node --test)
+// One predicate governs cache reads, writes, and stale fallback. A mirror's
+// refusal must neither end the search for healthy alternatives nor persist as
+// data under the week/month-long cache TTLs. These cases use no live providers.
+//
+// Run with: npm test
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import {
-  simplifyOverpassPayloadBody,
-  isOverpassBoundaryQuery,
-  resolveOverpassPreflight,
-} from '../../vite.config.js';
+import { mkdir, readFile, writeFile, unlink } from 'node:fs/promises';
+import { createHash, randomUUID } from 'node:crypto';
+import path from 'node:path';
+import { Readable } from 'node:stream';
+import createViteConfig, { fetchOverpassPayload, overpassPayloadIsData, readOverpassDisk } from '../vite.config.js';
 
-test('preflight checks memory, in-flight, then disk before consuming limiter quota', async () => {
-  const key = 'normalized query';
-  const fresh = { id: 'memory', status: 200, cachedAt: 900 };
-  const joined = { id: 'inflight', status: 200, cachedAt: 950 };
-  const disk = { id: 'disk', status: 200, cachedAt: 975 };
-  let diskReads = 0;
-  let limiterCalls = 0;
-  const allowUpstream = () => { limiterCalls += 1; return true; };
+const ENDPOINTS = ['https://a.example/api', 'https://b.example/api', 'https://c.example/api'];
 
-  const memoryHit = await resolveOverpassPreflight({
-    cacheKey: key,
-    memoryCache: new Map([[key, fresh]]),
-    inFlight: new Map([[key, Promise.resolve(joined)]]),
-    readDisk: async () => { diskReads += 1; return disk; },
-    allowUpstream,
-    now: 1000,
-    cacheMs: 200,
-  });
-  assert.equal(memoryHit.source, 'HIT');
-  assert.equal(memoryHit.payload, fresh);
-  assert.equal(diskReads, 0, 'memory hit must short-circuit before disk');
-  assert.equal(limiterCalls, 0, 'memory hit must not consume limiter quota');
-
-  const inFlightHit = await resolveOverpassPreflight({
-    cacheKey: key,
-    memoryCache: new Map([[key, { id: 'stale', status: 200, cachedAt: 0 }]]),
-    inFlight: new Map([[key, Promise.resolve(joined)]]),
-    readDisk: async () => { diskReads += 1; return disk; },
-    allowUpstream,
-    now: 1000,
-    cacheMs: 200,
-  });
-  assert.equal(inFlightHit.source, 'INFLIGHT');
-  assert.equal(inFlightHit.payload, joined);
-  assert.equal(diskReads, 0, 'in-flight join must short-circuit before disk');
-  assert.equal(limiterCalls, 0, 'in-flight join must not consume limiter quota');
-
-  const diskHit = await resolveOverpassPreflight({
-    cacheKey: key,
-    memoryCache: new Map(),
-    inFlight: new Map(),
-    readDisk: async () => { diskReads += 1; return disk; },
-    allowUpstream,
-  });
-  assert.equal(diskHit.source, 'DISK');
-  assert.equal(diskHit.payload, disk);
-  assert.equal(diskReads, 1);
-  assert.equal(limiterCalls, 0, 'disk hit must not consume limiter quota');
-
-  const upstreamMiss = await resolveOverpassPreflight({
-    cacheKey: key,
-    memoryCache: new Map(),
-    inFlight: new Map(),
-    readDisk: async () => { diskReads += 1; return null; },
-    allowUpstream,
-  });
-  assert.equal(upstreamMiss.source, 'UPSTREAM');
-  assert.equal(diskReads, 2, 'disk must be checked before upstream admission');
-  assert.equal(limiterCalls, 1, 'only a complete cache miss consumes quota');
-
-  const denied = await resolveOverpassPreflight({
-    cacheKey: key,
-    memoryCache: new Map(),
-    inFlight: new Map(),
-    readDisk: async () => null,
-    allowUpstream: () => false,
-  });
-  assert.equal(denied.source, 'RATE_LIMITED');
-});
-
-test('preflight treats cached refusals as misses without spending extra quota', async () => {
-  for (const invalid of [{ status: 406 }, { status: 200, runtimeError: true }]) {
-    let admissions = 0;
-    const result = await resolveOverpassPreflight({
-      cacheKey: 'refused',
-      memoryCache: new Map([['refused', { ...invalid, cachedAt: Date.now() }]]),
-      inFlight: new Map(),
-      readDisk: async () => ({ ...invalid, cachedAt: Date.now() }),
-      allowUpstream: () => { admissions++; return true; },
-    });
-    assert.equal(result.source, 'UPSTREAM');
-    assert.equal(admissions, 1);
-  }
-});
-
-/** Synthetic dense ring: N points on a circle with sub-tolerance jitter. */
-function denseRing(n, { latC = 37.5, lonC = 14.2, radiusDeg = 0.5 } = {}) {
-  const pts = [];
-  for (let i = 0; i < n; i++) {
-    const a = (i / n) * 2 * Math.PI;
-    // Jitter far below the simplification tolerance so the ring is genuinely
-    // redundant — a correct simplifier should collapse most of it.
-    const jitter = (i % 7) * 0.000004;
-    pts.push({
-      lat: latC + Math.sin(a) * (radiusDeg + jitter),
-      lon: lonC + Math.cos(a) * (radiusDeg + jitter),
-    });
-  }
-  pts.push({ ...pts[0] }); // closed ring
-  return pts;
+/** Answer each endpoint from a map of url → {status, body}; record the order. */
+function mirrors(byUrl) {
+  const tried = [];
+  const fetchImpl = async (url) => {
+    tried.push(url);
+    const answer = byUrl[url];
+    if (answer instanceof Error) throw answer;
+    return { status: answer.status, headers: { get: () => answer.contentType || 'application/json' } };
+  };
+  return { fetchImpl, tried, readBody: async (_, __) => byUrl[tried[tried.length - 1]]?.body ?? '' };
 }
 
-const TEST_OPTS = { minBytes: 0, minPoints: 200, toleranceDeg: 0.0004 };
+const run = (byUrl) => {
+  const m = mirrors(byUrl);
+  return fetchOverpassPayload('data=x', 1e6, {
+    endpoints: ENDPOINTS,
+    fetchImpl: m.fetchImpl,
+    readBody: m.readBody,
+    simplify: (body) => body,
+  }).then((payload) => ({ payload, tried: m.tried }), (error) => ({ error, tried: m.tried }));
+};
 
-test('simplify: giant way geometry is decimated, endpoints preserved', () => {
-  const ring = denseRing(4000);
-  const body = JSON.stringify({ elements: [{ type: 'way', id: 1, geometry: ring }] });
-  const out = JSON.parse(simplifyOverpassPayloadBody(body, TEST_OPTS));
-  const g = out.elements[0].geometry;
-  assert.ok(g.length < ring.length * 0.5, `should shed most redundant points, got ${g.length}/${ring.length}`);
-  assert.ok(g.length >= 16, `must keep enough points to stay a ring, got ${g.length}`);
-  assert.deepEqual(g[0], ring[0]);
-  assert.deepEqual(g[g.length - 1], ring[ring.length - 1]);
-});
+const DATA = { status: 200, body: '{"elements":[]}' };
 
-test('simplify: relation member geometries are decimated too', () => {
-  const ring = denseRing(3000);
-  const body = JSON.stringify({
-    elements: [{
-      type: 'relation',
-      id: 2,
-      members: [
-        { type: 'way', role: 'outer', geometry: ring },
-        { type: 'node', role: 'admin_centre' }, // no geometry — must survive untouched
-      ],
-    }],
-  });
-  const out = JSON.parse(simplifyOverpassPayloadBody(body, TEST_OPTS));
-  assert.ok(out.elements[0].members[0].geometry.length < ring.length * 0.5);
-  assert.equal(out.elements[0].members[1].geometry, undefined);
-});
-
-test('simplify: small geometries (building footprints) pass through untouched', () => {
-  const square = [
-    { lat: 30.27, lon: -97.74 }, { lat: 30.271, lon: -97.74 },
-    { lat: 30.271, lon: -97.741 }, { lat: 30.27, lon: -97.741 },
-    { lat: 30.27, lon: -97.74 },
-  ];
-  const body = JSON.stringify({ elements: [{ type: 'way', id: 3, geometry: square }] });
-  const out = JSON.parse(simplifyOverpassPayloadBody(body, TEST_OPTS));
-  assert.deepEqual(out.elements[0].geometry, square);
-});
-
-test('simplify: geometry stays within tolerance of the original shape', () => {
-  const ring = denseRing(4000);
-  const body = JSON.stringify({ elements: [{ type: 'way', id: 4, geometry: ring }] });
-  const out = JSON.parse(simplifyOverpassPayloadBody(body, TEST_OPTS));
-  const g = out.elements[0].geometry;
-  // Every original vertex must lie near SOME kept vertex — a circle of kept
-  // points at spacing s has every dropped point within ~s/2 along the arc, and
-  // DP guarantees perpendicular deviation ≤ tolerance. Loose sanity bound: no
-  // original point farther than 8× tolerance from the nearest kept point pair
-  // is possible for a smooth ring; check a sampled subset for speed.
-  for (let i = 0; i < ring.length; i += 97) {
-    const p = ring[i];
-    let best = Infinity;
-    for (let j = 1; j < g.length; j++) {
-      const d = pointSegDistDeg(p, g[j - 1], g[j]);
-      if (d < best) best = d;
+test('disk cache rejects old refusals for fresh and stale reads but preserves last-good data', async () => {
+  const key = `overpass-cache-regression-${randomUUID()}`;
+  const directory = path.join(process.cwd(), '.gev-cache', 'overpass');
+  const file = path.join(directory, `${createHash('sha1').update(key).digest('hex')}.json`);
+  await mkdir(directory, { recursive: true });
+  try {
+    for (const refusal of [
+      { status: 406 }, { status: 429 }, { status: 503 },
+      { status: 200, rateLimited: true }, { status: 200, runtimeError: true },
+    ]) {
+      await writeFile(file, JSON.stringify({ ...DATA, cachedAt: Date.now(), ...refusal }));
+      assert.equal(await readOverpassDisk(key, 60000), null, `fresh ${JSON.stringify(refusal)}`);
+      assert.equal(await readOverpassDisk(key, Infinity), null, `stale ${JSON.stringify(refusal)}`);
     }
-    assert.ok(best <= TEST_OPTS.toleranceDeg * 1.01, `vertex ${i} deviates ${best} deg`);
+    const good = { ...DATA, cachedAt: Date.now() - 120000 };
+    await writeFile(file, JSON.stringify(good));
+    assert.equal(await readOverpassDisk(key, 60000), null, 'expired good data misses normal TTL');
+    assert.deepEqual(await readOverpassDisk(key, Infinity), good, 'last-good data survives an outage');
+    await writeFile(file, '{invalid');
+    assert.equal(await readOverpassDisk(key, Infinity), null, 'corrupt cache is ignored');
+  } finally {
+    await unlink(file);
   }
 });
 
-test('simplify: sub-threshold bodies and non-JSON pass through byte-identical', () => {
-  const tiny = JSON.stringify({ elements: [{ type: 'way', geometry: denseRing(3000) }] });
-  assert.equal(simplifyOverpassPayloadBody(tiny, { ...TEST_OPTS, minBytes: tiny.length + 1 }), tiny);
-  const junk = 'this is not json {';
-  assert.equal(simplifyOverpassPayloadBody(junk, TEST_OPTS), junk);
+// ── The predicate ────────────────────────────────────────────────────────────
+
+test('only a 2xx that is neither rate-limited nor a runtime error is data', () => {
+  assert.equal(overpassPayloadIsData({ status: 200 }), true);
+  assert.equal(overpassPayloadIsData({ status: 204 }), true);
+
+  // The measured refusal, and its neighbours. `< 500` admitted every one.
+  for (const status of [400, 403, 406, 410, 429]) {
+    assert.equal(overpassPayloadIsData({ status }), false, `${status} is not data`);
+  }
+  assert.equal(overpassPayloadIsData({ status: 502 }), false);
+  // A 200 can still not be data: Overpass reports runtime failures in the body.
+  assert.equal(overpassPayloadIsData({ status: 200, runtimeError: true }), false);
+  assert.equal(overpassPayloadIsData({ status: 200, rateLimited: true }), false);
+  assert.equal(overpassPayloadIsData({}), false);
+  assert.equal(overpassPayloadIsData(null), false);
 });
 
-test('boundary-class queries detected for the long disk TTL', () => {
-  assert.equal(isOverpassBoundaryQuery(
-    '[out:json][timeout:25];is_in(37.5,14.2)->.a;area.a["boundary"="administrative"]["admin_level"];out tags;',
-  ), true);
-  assert.equal(isOverpassBoundaryQuery(
-    '[out:json][timeout:25];area(3600039152)->.x;rel(pivot.x);out geom;',
-  ), true);
-  // The enclosing-compound sweep and road fetches keep the default TTL.
-  assert.equal(isOverpassBoundaryQuery(
-    '[out:json][timeout:25];( way(around:1200,30.27,-97.74)["leisure"]["name"]; );out geom;',
-  ), false);
-  assert.equal(isOverpassBoundaryQuery(
-    '[out:json][timeout:12];way["highway"~"motorway|trunk"](30.1,-97.9,30.5,-97.5);out geom;',
-  ), false);
+// ── The fan-out ──────────────────────────────────────────────────────────────
+
+test('a refusal moves to the next mirror instead of ending the fan-out', async () => {
+  // The exact shape measured against the live mirrors.
+  const { payload, tried } = await run({
+    [ENDPOINTS[0]]: { status: 406, contentType: 'text/html', body: '<!DOCTYPE HTML><title>406</title>' },
+    [ENDPOINTS[1]]: DATA,
+    [ENDPOINTS[2]]: DATA,
+  });
+
+  assert.equal(payload.status, 200);
+  assert.equal(payload.endpoint, ENDPOINTS[1]);
+  assert.deepEqual(tried, ENDPOINTS.slice(0, 2), 'the healthy mirror must be reached, and no further');
 });
 
-/** Perpendicular distance (deg, planar approx) from p to segment a-b. */
-function pointSegDistDeg(p, a, b) {
-  const vx = b.lon - a.lon;
-  const vy = b.lat - a.lat;
-  const wx = p.lon - a.lon;
-  const wy = p.lat - a.lat;
-  const c1 = vx * wx + vy * wy;
-  if (c1 <= 0) return Math.hypot(wx, wy);
-  const c2 = vx * vx + vy * vy;
-  if (c2 <= c1) return Math.hypot(p.lon - b.lon, p.lat - b.lat);
-  const t = c1 / c2;
-  return Math.hypot(wx - t * vx, wy - t * vy);
+test('the first mirror to answer wins, and the rest are left alone', async () => {
+  const { payload, tried } = await run({
+    [ENDPOINTS[0]]: DATA, [ENDPOINTS[1]]: DATA, [ENDPOINTS[2]]: DATA,
+  });
+
+  assert.equal(payload.endpoint, ENDPOINTS[0]);
+  assert.deepEqual(tried, [ENDPOINTS[0]]);
+});
+
+test('a refusal every mirror agrees on is reported, not swallowed', async () => {
+  // A genuinely bad query must still say what upstream said — but only after
+  // every mirror has had its chance to answer it.
+  const refusal = { status: 400, body: 'line 1: parse error' };
+  const { payload, tried } = await run({
+    [ENDPOINTS[0]]: refusal, [ENDPOINTS[1]]: refusal, [ENDPOINTS[2]]: refusal,
+  });
+
+  assert.equal(payload.status, 400);
+  assert.equal(payload.endpoint, ENDPOINTS[0], 'the FIRST refusal is the one reported');
+  assert.deepEqual(tried, ENDPOINTS);
+  assert.equal(overpassPayloadIsData(payload), false, 'so it is neither cached nor served as data');
+});
+
+test('a mirror that throws is no different from one that refuses', async () => {
+  const { payload, tried } = await run({
+    [ENDPOINTS[0]]: new Error('ECONNRESET'),
+    [ENDPOINTS[1]]: { status: 503, body: 'busy' },
+    [ENDPOINTS[2]]: DATA,
+  });
+
+  assert.equal(payload.endpoint, ENDPOINTS[2]);
+  assert.deepEqual(tried, ENDPOINTS);
+});
+
+test('when every mirror is unreachable the caller gets a throw, not a payload', async () => {
+  const { error, payload } = await run({
+    [ENDPOINTS[0]]: new Error('ECONNRESET'),
+    [ENDPOINTS[1]]: new Error('ETIMEDOUT'),
+    [ENDPOINTS[2]]: new Error('ENOTFOUND'),
+  });
+
+  assert.equal(payload, undefined);
+  assert.match(error.message, /ENOTFOUND/);
+});
+
+test('production reader rotates past oversized, runtime-error and rate-limited bodies', async () => {
+  for (const [status, body] of [
+    [200, 'x'.repeat(200)], [200, '{"remark":"runtime error: timed out","elements":[]}'],
+    [200, 'rate_limited'], [429, 'busy'], [403, 'forbidden'],
+  ]) {
+    const tried = [];
+    const payload = await fetchOverpassPayload('data=x', 100, {
+      endpoints: ENDPOINTS,
+      fetchImpl: async (url) => {
+        tried.push(url);
+        return new Response(tried.length === 1 ? body : DATA.body, {
+          status: tried.length === 1 ? status : 200,
+          headers: { 'content-type': 'application/json' },
+        });
+      },
+    });
+    assert.equal(payload.body, DATA.body);
+    assert.deepEqual(tried, ENDPOINTS.slice(0, 2));
+  }
+});
+
+function proxyHandler() {
+  const plugin = createViteConfig({ mode: 'test' }).plugins.find(p => p.name === 'overpass-proxy');
+  const routes = new Map();
+  plugin.configureServer({ middlewares: { use: (route, handler) => routes.set(route, handler) } });
+  return routes.get('/api/overpass');
 }
+
+function invoke(handler, body) {
+  const req = Readable.from([Buffer.from(body)]);
+  Object.assign(req, { method: 'POST', headers: {}, socket: { remoteAddress: '127.0.0.1' } });
+  return new Promise((resolve, reject) => {
+    const res = {
+      writeHead(status, headers) { this.status = status; this.headers = headers; },
+      end(body) { resolve({ status: this.status, headers: this.headers, body }); },
+    };
+    Promise.resolve(handler(req, res)).catch(reject);
+  });
+}
+
+test('coalesced outage callers both receive last-good data, never a cached refusal', async (t) => {
+  const handler = proxyHandler();
+  for (const status of [406, 503, 429]) {
+    const query = `[out:json][timeout:12];node(around:10,30.27,-97.74)["name"="${randomUUID()}"];out;`;
+    const body = `data=${encodeURIComponent(query)}`;
+    const directory = path.join(process.cwd(), '.gev-cache', 'overpass');
+    const file = path.join(directory, `${createHash('sha1').update(body).digest('hex')}.json`);
+    await mkdir(directory, { recursive: true });
+    const stale = { ...DATA, cachedAt: Date.now() - 40 * 86400000 };
+    await writeFile(file, JSON.stringify(stale));
+    const entered = Promise.withResolvers();
+    const release = Promise.withResolvers();
+    let fetches = 0;
+    const mock = t.mock.method(globalThis, 'fetch', async () => {
+      fetches++;
+      entered.resolve();
+      await release.promise;
+      return new Response('upstream unavailable', { status });
+    });
+    try {
+      const first = invoke(handler, body);
+      await entered.promise;
+      const second = invoke(handler, body);
+      // The second request consumes its in-memory stream and joins the pending
+      // promise before releasing upstream. No network or elapsed-time sleep.
+      await new Promise(resolve => setImmediate(resolve));
+      release.resolve();
+      for (const response of await Promise.all([first, second])) {
+        assert.equal(response.status, 200, `${status}: both callers use last-good data`);
+        assert.equal(response.body, DATA.body);
+        assert.equal(response.headers['X-Overpass-Cache'], 'STALE');
+      }
+      assert.equal(fetches, 4, 'one shared, bounded mirror sequence');
+      assert.deepEqual(JSON.parse(await readFile(file, 'utf8')), stale);
+    } finally {
+      release.resolve();
+      mock.mock.restore();
+      await unlink(file);
+    }
+  }
+});
